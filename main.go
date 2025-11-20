@@ -483,7 +483,7 @@ func main() {
 	r := gin.Default()
 	// ---------------- CORS ----------------
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://192.168.99.15:5173", "http://127.0.0.1:5173"}, // 前端地址
+		AllowOrigins:     []string{"http://192.168.99.15:5173", "http://127.0.0.1:5173", "*"}, // 前端地址
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
