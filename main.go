@@ -71,7 +71,7 @@ func initDB() {
 	}
 
 	// 自动迁移
-	db.AutoMigrate(&User{}, &Archive{}, &Comment{}, &ArchiveStat{})
+	db.AutoMigrate(&User{}, &Archive{}, &Comment{}, &ArchiveStat{}, &Rating{}, &LoginStat{})
 	fmt.Println("数据库表初始化完成")
 }
 
@@ -131,6 +131,12 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
+type LoginStat struct {
+	ID        uint `gorm:"primaryKey"`
+	Count     int  `gorm:"default:0"`
+	UpdatedAt time.Time
+}
+
 func loginHandler(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -152,6 +158,13 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	// 登录次数 +1
+	var stat LoginStat
+	if err := db.First(&stat).Error; err != nil {
+		db.Create(&LoginStat{Count: 1})
+	} else {
+		db.Model(&stat).UpdateColumn("count", gorm.Expr("count + 1"))
+	}
 	token, err := generateJWT(user.Username, user.Role)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成 token 失败"})
@@ -167,9 +180,9 @@ func loginHandler(c *gin.Context) {
 // ---------------- 注册接口 ----------------
 
 type RegisterRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Role     string `json:"role"` // admin 或 user
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	InviteCode string `json:"invite_code"` // 新增：邀请码
 }
 
 func registerHandler(c *gin.Context) {
@@ -179,13 +192,28 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
+	// 固定邀请码
+	const adminInviteCode = "ADMIN-2025-SECRET"
+
+	// 判断角色
+	role := "user" // 默认普通用户
+
+	if req.InviteCode != "" {
+		if req.InviteCode == adminInviteCode {
+			role = "admin" // 邀请码正确，允许管理员注册
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "邀请码错误，无法注册为管理员"})
+			return
+		}
+	}
+
 	// bcrypt 加密密码
 	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 
 	user := User{
 		Username: req.Username,
 		Password: string(hashedPassword),
-		Role:     req.Role,
+		Role:     role,
 	}
 
 	if err := db.Create(&user).Error; err != nil {
@@ -193,7 +221,10 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "注册成功"})
+	c.JSON(http.StatusOK, gin.H{
+		"message": "注册成功",
+		"role":    role,
+	})
 }
 
 // ---------------- 上传档案接口 ----------------
@@ -475,6 +506,60 @@ func batchUploadHandler(c *gin.Context) {
 	})
 }
 
+type Rating struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Score     int       `json:"score"`
+	IP        string    `json:"ip"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type RatingRequest struct {
+	Score int `json:"score" binding:"required,min=1,max=5"`
+}
+
+func SubmitRating(c *gin.Context) {
+	var req RatingRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "score 必须是 1~5 的整数",
+		})
+		return
+	}
+
+	ip := c.ClientIP()
+
+	rating := Rating{
+		Score: req.Score,
+		IP:    ip,
+	}
+
+	if err := db.Create(&rating).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "评分成功，感谢反馈！",
+	})
+}
+
+func GetLoginTimes(c *gin.Context) {
+	role := c.GetString("role")
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权限"})
+		return
+	}
+
+	var stat LoginStat
+	db.First(&stat)
+
+	c.JSON(http.StatusOK, gin.H{
+		"count": stat.Count,
+		"time":  stat.UpdatedAt,
+	})
+}
+
 // ---------------- 主函数 ----------------
 
 func main() {
@@ -483,7 +568,7 @@ func main() {
 	r := gin.Default()
 	// ---------------- CORS ----------------
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://192.168.99.15:5173", "http://127.0.0.1:5173", "*"}, // 前端地址
+		AllowOrigins:     []string{"http://192.168.99.16:5173", "http://127.0.0.1:5173", "*"}, // 前端地址
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -502,6 +587,8 @@ func main() {
 		auth.GET("/archives", listArchivesHandler)
 		auth.GET("/archives/download", downloadArchiveHandler)
 		auth.POST("/archives/batch_upload", batchUploadHandler)
+		auth.GET("/login_stat", GetLoginTimes)
+		r.POST("/rating", SubmitRating)
 	}
 
 	fmt.Println("服务启动: http://localhost:8080")
