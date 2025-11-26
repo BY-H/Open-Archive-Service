@@ -388,6 +388,22 @@ func getFileExtension(path string) string {
 	return ""
 }
 
+func DownloadStat(c *gin.Context) {
+	role := c.GetString("role")
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权限"})
+		return
+	}
+
+	var total int64
+	// SUM(download_count)
+	db.Model(&ArchiveStat{}).Select("SUM(download_count)").Scan(&total)
+
+	c.JSON(http.StatusOK, gin.H{
+		"total_download_count": total,
+	})
+}
+
 func batchUploadHandler(c *gin.Context) {
 	role := c.GetString("role")
 	username := c.GetString("username")
@@ -544,6 +560,15 @@ func SubmitRating(c *gin.Context) {
 	})
 }
 
+func AverageRating(c *gin.Context) {
+	var avg float64
+	db.Model(&Rating{}).Select("AVG(score)").Scan(&avg)
+
+	c.JSON(http.StatusOK, gin.H{
+		"average": avg,
+	})
+}
+
 func GetLoginTimes(c *gin.Context) {
 	role := c.GetString("role")
 	if role != "admin" {
@@ -589,6 +614,8 @@ func main() {
 		auth.POST("/archives/batch_upload", batchUploadHandler)
 		auth.GET("/login_stat", GetLoginTimes)
 		r.POST("/rating", SubmitRating)
+		auth.GET("/ratings/average", AverageRating)
+		auth.GET("/archives/download_stat", DownloadStat)
 	}
 
 	fmt.Println("服务启动: http://localhost:8080")
