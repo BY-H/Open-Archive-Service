@@ -522,6 +522,53 @@ func batchUploadHandler(c *gin.Context) {
 	})
 }
 
+// ---------------- 删除档案接口 ----------------
+func deleteArchiveHandler(c *gin.Context) {
+	role := c.GetString("role")
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权限删除档案"})
+		return
+	}
+
+	// 从 URL 参数获取档案 ID
+	idStr := c.Query("id")
+	if idStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少档案 ID"})
+		return
+	}
+
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "档案 ID 格式错误"})
+		return
+	}
+
+	var archive Archive
+	if err := db.First(&archive, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "档案不存在"})
+		return
+	}
+
+	// 删除文件（如果存在）
+	if archive.FilePath != "" {
+		_ = os.Remove(archive.FilePath) // 忽略文件不存在的错误
+	}
+
+	// 删除下载统计（可选，但推荐）
+	db.Where("archive_id = ?", archive.ID).Delete(&ArchiveStat{})
+
+	// 删除档案记录
+	if err := db.Delete(&archive).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "档案删除成功",
+		"archive_id": archive.ID,
+	})
+}
+
 type Rating struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Score     int       `json:"score"`
@@ -614,6 +661,7 @@ func main() {
 		auth.POST("/archives/batch_upload", batchUploadHandler)
 		auth.GET("/login_stat", GetLoginTimes)
 		r.POST("/rating", SubmitRating)
+		auth.DELETE("/archives", deleteArchiveHandler)
 		auth.GET("/ratings/average", AverageRating)
 		auth.GET("/archives/download_stat", DownloadStat)
 	}
