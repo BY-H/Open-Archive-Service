@@ -245,7 +245,7 @@ func uploadArchiveHandler(c *gin.Context) {
 	retention := c.PostForm("retention_period")
 
 	// 校验字段
-	if archiveNo == "" || title == "" || formTime == "" || retention == "" {
+	if archiveNo == "" || title == "" || formTime == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少必要字段"})
 		return
 	}
