@@ -2,25 +2,75 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/spf13/viper"
 	"github.com/xuri/excelize/v2"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
+	sms "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/sms/v20210111"
 )
 
 // JWT密钥
 var jwtSecret = []byte("NWFhOaHlYtdLR2fdlQqUj8CSXgb2ebnN2DcjlXfV8zZ")
 
+var credential *common.Credential
+
+var smsClient *sms.Client
+
 var db *gorm.DB
+
+type Config struct {
+	Server struct {
+		Port int `mapstructure:"port"`
+	} `mapstructure:"server"`
+
+	Tencent struct {
+		SecretID  string `mapstructure:"secret_id"`
+		SecretKey string `mapstructure:"secret_key"`
+
+		SMS struct {
+			AppID      string `mapstructure:"app_id"`
+			SignName   string `mapstructure:"sign_name"`
+			TemplateID string `mapstructure:"template_id"`
+		} `mapstructure:"sms"`
+	} `mapstructure:"tencent"`
+
+	Dsn string `mapstructure:"dsn"`
+}
+
+var Cfg *Config
+
+func InitConfig() {
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath("./config")
+
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatalf("read config failed: %v", err)
+	}
+
+	var cfg Config
+	if err := viper.Unmarshal(&cfg); err != nil {
+		log.Fatalf("unmarshal config failed: %v", err)
+	}
+
+	Cfg = &cfg
+}
 
 // ---------------- 数据库模型 ----------------
 
@@ -63,7 +113,7 @@ type ArchiveStat struct {
 // ---------------- 数据库初始化 ----------------
 
 func initDB() {
-	dsn := "root:429520hby@tcp(undefiner.cn:3306)/OpenArchive?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := Cfg.Dsn
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -73,6 +123,23 @@ func initDB() {
 	// 自动迁移
 	db.AutoMigrate(&User{}, &Archive{}, &Comment{}, &ArchiveStat{}, &Rating{}, &LoginStat{})
 	fmt.Println("数据库表初始化完成")
+}
+
+func initSmsClient() {
+	credential = common.NewCredential(
+		Cfg.Tencent.SecretID,
+		Cfg.Tencent.SecretKey,
+	)
+	cpf := profile.NewClientProfile()
+	/* SDK默认使用POST方法。
+	 * 如果您一定要使用GET方法，可以在这里设置。GET方法无法处理一些较大的请求 */
+	cpf.HttpProfile.ReqMethod = "POST"
+	cpf.HttpProfile.ReqTimeout = 10 // 请求超时时间，单位为秒(默认60秒)
+	/* 指定接入地域域名，默认就近地域接入域名为 sms.tencentcloudapi.com ，也支持指定地域域名访问，例如广州地域的域名为 sms.ap-guangzhou.tencentcloudapi.com */
+	cpf.HttpProfile.Endpoint = "sms.tencentcloudapi.com"
+	/* SDK默认用TC3-HMAC-SHA256进行签名，非必要请不要修改这个字段 */
+	cpf.SignMethod = "HmacSHA1"
+	smsClient, _ = sms.NewClient(credential, "ap-guangzhou", cpf)
 }
 
 // ---------------- JWT ----------------
@@ -122,6 +189,200 @@ func authMiddleware() gin.HandlerFunc {
 		c.Set("role", claims["role"])
 		c.Next()
 	}
+}
+
+func generateCode() string {
+	return fmt.Sprintf("%06d", time.Now().UnixNano()%1000000)
+}
+
+// ---------------- 发送短信函数 ----------------
+func sendSMS(phone string, templateID string, params []string) error {
+	req := sms.NewSendSmsRequest()
+
+	// 应用 ID（短信控制台里有）
+	req.SmsSdkAppId = common.StringPtr("1401046126")
+
+	// 短信签名（必须是已审核通过的）
+	req.SignName = common.StringPtr("四川瀚博睿信息技术")
+
+	// 模板 ID
+	req.TemplateId = common.StringPtr(templateID)
+
+	// 模板参数
+	req.TemplateParamSet = common.StringPtrs(params)
+
+	// 手机号（必须是 E.164 格式）
+	req.PhoneNumberSet = common.StringPtrs([]string{
+		"+86" + phone,
+	})
+
+	resp, err := smsClient.SendSms(req)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("SMS response: %+v\n", resp.Response)
+
+	return nil
+}
+
+type SmsCodeItem struct {
+	Code      string
+	ExpiresAt time.Time
+}
+
+var smsCodeStore = struct {
+	sync.RWMutex
+	data map[string]SmsCodeItem
+}{
+	data: make(map[string]SmsCodeItem),
+}
+
+type SmsSendRecord struct {
+	LastSend time.Time
+}
+
+var smsSendLimiter = struct {
+	sync.Mutex
+	data map[string]SmsSendRecord
+}{
+	data: make(map[string]SmsSendRecord),
+}
+
+func canSendSms(phone string, interval time.Duration) bool {
+	smsSendLimiter.Lock()
+	defer smsSendLimiter.Unlock()
+
+	record, exists := smsSendLimiter.data[phone]
+	if !exists {
+		return true
+	}
+
+	return time.Since(record.LastSend) >= interval
+}
+
+func markSmsSent(phone string) {
+	smsSendLimiter.Lock()
+	defer smsSendLimiter.Unlock()
+
+	smsSendLimiter.data[phone] = SmsSendRecord{
+		LastSend: time.Now(),
+	}
+}
+
+func setSmsCode(phone, code string, ttl time.Duration) {
+	smsCodeStore.Lock()
+	defer smsCodeStore.Unlock()
+
+	smsCodeStore.data[phone] = SmsCodeItem{
+		Code:      code,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+func getSmsCode(phone string) (string, bool) {
+	smsCodeStore.RLock()
+	item, ok := smsCodeStore.data[phone]
+	smsCodeStore.RUnlock()
+
+	if !ok {
+		return "", false
+	}
+
+	if time.Now().After(item.ExpiresAt) {
+		deleteSmsCode(phone)
+		return "", false
+	}
+
+	return item.Code, true
+}
+
+func deleteSmsCode(phone string) {
+	smsCodeStore.Lock()
+	defer smsCodeStore.Unlock()
+
+	delete(smsCodeStore.data, phone)
+}
+
+type SmsCodeRequest struct {
+	Phone string `json:"phone" binding:"required"`
+}
+
+func sendCodeHandler(c *gin.Context) {
+	var req SmsCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "手机号不能为空"})
+		return
+	}
+
+	matched, _ := regexp.MatchString(`^1[3-9]\d{9}$`, req.Phone)
+	if !matched {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "手机号格式错误"})
+		return
+	}
+
+	// ⭐ 1️⃣ 60 秒频率限制
+	if !canSendSms(req.Phone, 60*time.Second) {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error": "验证码发送过于频繁，请 60 秒后再试",
+		})
+		return
+	}
+
+	code := generateCode()
+
+	setSmsCode(req.Phone, code, 5*time.Minute)
+
+	err := sendSMS(
+		req.Phone,
+		"2534252",      // 短信模板 ID
+		[]string{code}, // 模板参数，验证码 {1}
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "短信发送失败"})
+		return
+	}
+
+	markSmsSent(req.Phone)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "验证码已发送",
+	})
+}
+
+func startSmsCodeCleaner() {
+	go func() {
+		for {
+			time.Sleep(1 * time.Minute)
+
+			now := time.Now()
+			smsCodeStore.Lock()
+			for phone, item := range smsCodeStore.data {
+				if now.After(item.ExpiresAt) {
+					delete(smsCodeStore.data, phone)
+				}
+			}
+			smsCodeStore.Unlock()
+		}
+	}()
+}
+
+func startSmsLimiterCleaner() {
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+
+			now := time.Now()
+			smsSendLimiter.Lock()
+			for phone, record := range smsSendLimiter.data {
+				if now.Sub(record.LastSend) > 10*time.Minute {
+					delete(smsSendLimiter.data, phone)
+				}
+			}
+			smsSendLimiter.Unlock()
+		}
+	}()
 }
 
 // ---------------- 登录接口 ----------------
@@ -180,9 +441,10 @@ func loginHandler(c *gin.Context) {
 // ---------------- 注册接口 ----------------
 
 type RegisterRequest struct {
-	Username   string `json:"username"`
-	Password   string `json:"password"`
-	InviteCode string `json:"invite_code"` // 新增：邀请码
+	Username   string `json:"username" binding:"required"` // 手机号
+	Password   string `json:"password" binding:"required"`
+	Code       string `json:"code" binding:"required"` // 短信验证码
+	InviteCode string `json:"invite_code"`
 }
 
 func registerHandler(c *gin.Context) {
@@ -192,32 +454,45 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	// 固定邀请码
-	const adminInviteCode = "ADMIN-2025-SECRET"
+	phone := req.Username // ⭐ 关键：username 就是手机号
 
-	// 判断角色
-	role := "user" // 默认普通用户
+	// 1️⃣ 校验短信验证码
+	code, ok := getSmsCode(phone)
+	if !ok || code != req.Code {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "验证码错误或已过期"})
+		return
+	}
+
+	// 用完即删，防止重复注册
+	deleteSmsCode(phone)
+
+	// 2️⃣ 管理员邀请码
+	const adminInviteCode = "ADMIN-2025-SECRET"
+	role := "user"
 
 	if req.InviteCode != "" {
 		if req.InviteCode == adminInviteCode {
-			role = "admin" // 邀请码正确，允许管理员注册
+			role = "admin"
 		} else {
 			c.JSON(http.StatusForbidden, gin.H{"error": "邀请码错误，无法注册为管理员"})
 			return
 		}
 	}
 
-	// bcrypt 加密密码
-	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	// 3️⃣ 密码加密
+	hashedPassword, _ := bcrypt.GenerateFromPassword(
+		[]byte(req.Password),
+		bcrypt.DefaultCost,
+	)
 
 	user := User{
-		Username: req.Username,
+		Username: phone, // 直接存手机号
 		Password: string(hashedPassword),
 		Role:     role,
 	}
 
 	if err := db.Create(&user).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名已存在"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "手机号已注册"})
 		return
 	}
 
@@ -635,7 +910,11 @@ func GetLoginTimes(c *gin.Context) {
 // ---------------- 主函数 ----------------
 
 func main() {
+	InitConfig()
 	initDB()
+	initSmsClient()
+	startSmsCodeCleaner()
+	startSmsLimiterCleaner()
 
 	r := gin.Default()
 	// ---------------- CORS ----------------
@@ -648,6 +927,7 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	r.POST("/sms/send", sendCodeHandler)
 	r.POST("/register", registerHandler)
 	r.POST("/login", loginHandler)
 
@@ -667,5 +947,5 @@ func main() {
 	}
 
 	fmt.Println("服务启动: http://localhost:8080")
-	r.Run(":8080")
+	r.Run(fmt.Sprintf(":%d", Cfg.Server.Port))
 }

@@ -1,0 +1,7 @@
+tencent:
+  secret_id: ""
+  secret_key: ""
+  sms:
+    app_id: ""
+    sign_name: ""
+    template_id: ""
