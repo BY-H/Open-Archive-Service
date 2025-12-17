@@ -200,10 +200,10 @@ func sendSMS(phone string, templateID string, params []string) error {
 	req := sms.NewSendSmsRequest()
 
 	// 应用 ID（短信控制台里有）
-	req.SmsSdkAppId = common.StringPtr("1401046126")
+	req.SmsSdkAppId = common.StringPtr(Cfg.Tencent.SMS.AppID)
 
 	// 短信签名（必须是已审核通过的）
-	req.SignName = common.StringPtr("四川瀚博睿信息技术")
+	req.SignName = common.StringPtr(Cfg.Tencent.SMS.SignName)
 
 	// 模板 ID
 	req.TemplateId = common.StringPtr(templateID)
@@ -335,8 +335,8 @@ func sendCodeHandler(c *gin.Context) {
 
 	err := sendSMS(
 		req.Phone,
-		"2534252",      // 短信模板 ID
-		[]string{code}, // 模板参数，验证码 {1}
+		Cfg.Tencent.SMS.TemplateID, // 短信模板 ID
+		[]string{code},             // 模板参数，验证码 {1}
 	)
 
 	if err != nil {
